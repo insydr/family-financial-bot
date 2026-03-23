@@ -1,0 +1,24 @@
+{
+  "name": "family-finance-bot",
+  "version": "1.0.0",
+  "description": "A Discord bot for managing family finances with AI-powered expense parsing",
+  "tasks": {
+    "start": "deno run --allow-env --allow-net --allow-read --allow-sys --unstable-kv mod.ts",
+    "dev": "deno run --allow-env --allow-net --allow-read --allow-sys --unstable-kv --watch mod.ts"
+  },
+  "imports": {
+    "discordeno": "jsr:@discordeno/bot@^21.0.0",
+    "std/dotenv": "jsr:@std/dotenv@^0.225.0"
+  },
+  "compilerOptions": {
+    "lib": ["deno.window", "deno.unstable"]
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "semiColons": true,
+    "singleQuote": true,
+    "proseWrap": "preserve"
+  }
+}

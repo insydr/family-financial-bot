@@ -1,0 +1,18 @@
+# Environment files (contains secrets!)
+.env
+.env.local
+.env.*.local
+
+# Deno
+deno.lock
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Deno KV data
+*.kv/
