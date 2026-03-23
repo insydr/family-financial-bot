@@ -4,7 +4,6 @@
     "dev": "deno run --allow-env --allow-net --allow-read --allow-sys --watch main.ts"
   },
   "imports": {
-    "discordeno": "https://deno.land/x/discordeno@18.0.1/mod.ts",
     "std/dotenv": "jsr:@std/dotenv@0.225.0"
   },
   "compilerOptions": {

@@ -9,19 +9,10 @@
  */
 
 import {
-  createBot,
-  startBot,
-  Intents,
-  Bot,
-  EventHandlers,
-  InteractionResponseTypes,
-} from 'discordeno';
-import {
   initializeWhitelist,
   isUserAllowed,
   formatCurrency,
   formatMonthYear,
-  mightBeExpense,
   auditLog,
 } from './utils.ts';
 import {
@@ -38,68 +29,86 @@ import { parseExpenseWithAI, testAIConnection } from './ai.ts';
  * Color constants for embeds.
  */
 const COLORS = {
-  SUCCESS: 0x22c55e, // Green
-  ERROR: 0xef4444,   // Red
-  WARNING: 0xf59e0b, // Yellow
-  INFO: 0x3b82f6,    // Blue
+  SUCCESS: 0x22c55e,
+  ERROR: 0xef4444,
+  WARNING: 0xf59e0b,
+  INFO: 0x3b82f6,
 };
 
-/**
- * Emoji constants for reactions.
- */
-const EMOJI = {
-  CONFIRM: '✅',
-  CANCEL: '❌',
-  THINKING: '🤔',
-  ERROR: '❗',
+// Store command definitions for registration
+const COMMANDS = {
+  help: {
+    name: 'help',
+    description: 'Show available commands and how to use the bot',
+  },
+  summary: {
+    name: 'summary',
+    description: 'Show your spending summary for the current month',
+  },
+  clear: {
+    name: 'clear',
+    description: 'Clear all your transaction data',
+  },
+  expense: {
+    name: 'expense',
+    description: 'Log a new expense using natural language',
+    options: [{
+      name: 'description',
+      description: 'Describe your expense (e.g., "Bought groceries for $50")',
+      type: 3,
+      required: true,
+    }],
+  },
 };
 
-// Bot instance
-let bot: Bot;
-let guildId: bigint;
+// Global config
+let applicationId: string;
+let botToken: string;
 
 /**
  * Main function - initializes and starts the bot.
- * On Deno Deploy, this runs an HTTP server for interactions.
- * Locally, it connects via WebSocket gateway.
  */
 async function main(): Promise<void> {
   console.log('═══════════════════════════════════════════════════════');
   console.log('       Family Finance Bot - Starting Up');
   console.log('═══════════════════════════════════════════════════════');
 
-  // Check if running on Deno Deploy
   const isDenoDeploy = Deno.env.get('DENO_DEPLOYMENT_ID') !== undefined;
   console.log(`[SETUP] Running on ${isDenoDeploy ? 'Deno Deploy' : 'local environment'}`);
 
-  // Initialize all components
   try {
-    // 1. Initialize whitelist (security)
+    // 1. Initialize whitelist
     initializeWhitelist();
 
     // 2. Initialize database
     await initializeDatabase();
 
-    // 3. Test AI connection (warn if unavailable)
+    // 3. Test AI connection
     const aiReady = await testAIConnection();
     if (!aiReady) {
       console.warn('[SETUP] AI service not ready - expense parsing may fail');
     }
 
-    // 4. Get guild ID
-    guildId = BigInt(Deno.env.get('DISCORD_GUILD_ID') || '0');
-    if (!guildId) {
-      throw new Error('DISCORD_GUILD_ID is required');
+    // 4. Get required config
+    botToken = Deno.env.get('DISCORD_TOKEN') || '';
+    applicationId = Deno.env.get('DISCORD_APPLICATION_ID') || '';
+    const publicKey = Deno.env.get('DISCORD_PUBLIC_KEY') || '';
+    const guildId = Deno.env.get('DISCORD_GUILD_ID') || '';
+
+    if (!botToken || !applicationId || !publicKey || !guildId) {
+      throw new Error('Missing required environment variables: DISCORD_TOKEN, DISCORD_APPLICATION_ID, DISCORD_PUBLIC_KEY, DISCORD_GUILD_ID');
     }
 
-    if (isDenoDeploy) {
-      // Deno Deploy: Use HTTP Interactions
-      await startHttpServer();
-    } else {
-      // Local: Use WebSocket Gateway
-      await startGatewayBot();
-    }
+    // 5. Register slash commands with Discord API
+    console.log('[SETUP] Registering slash commands...');
+    await registerCommands(guildId);
 
+    // 6. Start HTTP server
+    const port = parseInt(Deno.env.get('PORT') || '8000');
+    
+    Deno.serve({ port }, (request) => handleInteraction(request, publicKey));
+
+    console.log(`[HTTP] Server listening on port ${port}`);
     console.log('═══════════════════════════════════════════════════════');
     console.log('       Family Finance Bot - Ready!');
     console.log('═══════════════════════════════════════════════════════');
@@ -111,69 +120,69 @@ async function main(): Promise<void> {
 }
 
 /**
- * Start the bot using WebSocket Gateway (for local development).
+ * Register slash commands with Discord API.
  */
-async function startGatewayBot(): Promise<void> {
-  const token = Deno.env.get('DISCORD_TOKEN');
-  if (!token) {
-    throw new Error('DISCORD_TOKEN is required');
-  }
-
-  bot = createBot({
-    token,
-    intents: Intents.Guilds | Intents.GuildMessages | Intents.MessageContent | Intents.GuildMessageReactions,
-    events: {} as EventHandlers,
-  });
-
-  // Set up event handlers
-  setupGatewayEventHandlers();
-
-  await startBot(bot);
-  await registerCommands(bot, guildId);
-
-  console.log('[DISCORD] Gateway bot connected');
-}
-
-/**
- * Start HTTP server for Discord Interactions (for Deno Deploy).
- */
-async function startHttpServer(): Promise<void> {
-  const token = Deno.env.get('DISCORD_TOKEN');
-  const publicKey = Deno.env.get('DISCORD_PUBLIC_KEY');
-  const applicationId = Deno.env.get('DISCORD_APPLICATION_ID');
-
-  if (!token || !publicKey || !applicationId) {
-    throw new Error('DISCORD_TOKEN, DISCORD_PUBLIC_KEY, and DISCORD_APPLICATION_ID are required for Deno Deploy');
-  }
-
-  bot = createBot({
-    token,
-    applicationId: BigInt(applicationId),
-    intents: 0, // No gateway intents needed for HTTP interactions
-    events: {} as EventHandlers,
-  });
-
-  // Register commands on startup
-  await registerCommands(bot, guildId);
-
-  // Start HTTP server
-  const port = parseInt(Deno.env.get('PORT') || '8000');
+async function registerCommands(guildId: string): Promise<void> {
+  const url = `https://discord.com/api/v10/applications/${applicationId}/guilds/${guildId}/commands`;
   
-  Deno.serve({ port }, async (request: Request) => {
-    return await handleInteraction(request, publicKey, token);
-  });
+  const commands = [
+    {
+      name: 'help',
+      description: 'Show available commands and how to use the bot',
+      type: 1,
+    },
+    {
+      name: 'summary',
+      description: 'Show your spending summary for the current month',
+      type: 1,
+    },
+    {
+      name: 'clear',
+      description: 'Clear all your transaction data',
+      type: 1,
+    },
+    {
+      name: 'expense',
+      description: 'Log a new expense using natural language',
+      type: 1,
+      options: [{
+        name: 'description',
+        description: 'Describe your expense (e.g., "Bought groceries for $50")',
+        type: 3,
+        required: true,
+      }],
+    },
+  ];
 
-  console.log(`[HTTP] Server listening on port ${port}`);
+  try {
+    const response = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bot ${botToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(commands),
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error('[DISCORD] Failed to register commands:', response.status, error);
+      throw new Error(`Failed to register commands: ${response.status}`);
+    }
+
+    const data = await response.json();
+    console.log(`[DISCORD] Registered ${data.length} slash commands:`, data.map((c: any) => c.name).join(', '));
+  } catch (error) {
+    console.error('[DISCORD] Error registering commands:', error);
+    throw error;
+  }
 }
 
 /**
  * Handle incoming Discord Interaction via HTTP.
  */
-async function handleInteraction(
-  request: Request,
-  publicKey: string,
-  token: string
-): Promise<Response> {
+async function handleInteraction(request: Request, publicKey: string): Promise<Response> {
+  // Only accept POST requests
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
   }
@@ -183,40 +192,41 @@ async function handleInteraction(
     const signature = request.headers.get('X-Signature-Ed25519');
     const timestamp = request.headers.get('X-Signature-Timestamp');
 
-    // Verify Discord signature
+    // Validate signatures exist
     if (!signature || !timestamp) {
+      console.warn('[HTTP] Missing signatures');
       return new Response('Missing signatures', { status: 401 });
     }
 
-    // Note: In production, you should verify the signature using tweetnacl
-    // For simplicity, we're skipping verification here
-    // See: https://discord.com/developers/docs/interactions/receiving-and-responding#security-and-authorization
-
-    const interaction = JSON.parse(body);
-
-    // Handle PING (Discord verification)
-    if (interaction.type === 1) {
-      return new Response(JSON.stringify({ type: 1 }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+    // Verify signature using Web Crypto API
+    const isValid = await verifySignature(body, signature, timestamp, publicKey);
+    if (!isValid) {
+      console.warn('[HTTP] Invalid signature');
+      return new Response('Invalid signature', { status: 401 });
     }
 
-    // Handle APPLICATION_COMMAND
+    const interaction = JSON.parse(body);
+    console.log(`[HTTP] Received interaction type: ${interaction.type}`);
+
+    // Handle PING (Discord endpoint URL verification)
+    if (interaction.type === 1) {
+      console.log('[HTTP] Responding to PING');
+      return jsonResponse({ type: 1 });
+    }
+
+    // Handle APPLICATION_COMMAND (slash commands)
     if (interaction.type === 2) {
-      return await handleSlashCommand(interaction, token);
+      return await handleSlashCommand(interaction);
     }
 
     // Handle MESSAGE_COMPONENT (button clicks)
     if (interaction.type === 3) {
-      return await handleComponent(interaction, token);
+      return await handleComponent(interaction);
     }
 
-    // Handle MODAL_SUBMIT
-    if (interaction.type === 5) {
-      return await handleModalSubmit(interaction, token);
-    }
-
+    console.warn('[HTTP] Unknown interaction type:', interaction.type);
     return new Response('Unknown interaction type', { status: 400 });
+
   } catch (error) {
     console.error('[HTTP] Error handling interaction:', error);
     return new Response('Internal error', { status: 500 });
@@ -224,184 +234,169 @@ async function handleInteraction(
 }
 
 /**
+ * Verify Discord signature using Web Crypto API.
+ */
+async function verifySignature(
+  body: string,
+  signature: string,
+  timestamp: string,
+  publicKey: string
+): Promise<boolean> {
+  try {
+    // Convert hex signature to Uint8Array
+    const sigBytes = hexToBytes(signature);
+    
+    // Convert public key from hex to Uint8Array
+    const pubKeyBytes = hexToBytes(publicKey);
+    
+    // Create message to verify (timestamp + body)
+    const message = new TextEncoder().encode(timestamp + body);
+    
+    // Import public key for Ed25519 verification
+    const key = await crypto.subtle.importKey(
+      'raw',
+      pubKeyBytes,
+      { name: 'Ed25519', namedCurve: 'Ed25519' },
+      false,
+      ['verify']
+    );
+    
+    // Verify signature
+    return await crypto.subtle.verify(
+      'Ed25519',
+      key,
+      sigBytes,
+      message
+    );
+  } catch (error) {
+    console.error('[CRYPTO] Signature verification error:', error);
+    return false;
+  }
+}
+
+/**
+ * Convert hex string to Uint8Array.
+ */
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  }
+  return bytes;
+}
+
+/**
+ * Create a JSON response.
+ */
+function jsonResponse(data: any): Response {
+  return new Response(JSON.stringify(data), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+/**
  * Handle slash command interactions.
  */
-async function handleSlashCommand(interaction: any, token: string): Promise<Response> {
+async function handleSlashCommand(interaction: any): Promise<Response> {
   const userId = BigInt(interaction.member?.user?.id || interaction.user?.id || '0');
   const commandName = interaction.data?.name;
 
+  console.log(`[COMMAND] User ${userId} executed /${commandName}`);
+
   // Security check
   if (!isUserAllowed(userId)) {
-    return new Response(JSON.stringify({
+    return jsonResponse({
       type: 4,
       data: {
         content: '❌ You are not authorized to use this bot.',
         flags: 64,
       },
-    }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   }
 
   auditLog('COMMAND', userId, commandName || 'unknown');
 
   switch (commandName) {
-    case 'summary': {
-      return await handleSummaryCommand(interaction, userId);
-    }
-    case 'help': {
-      return handleHelpCommand(interaction);
-    }
-    case 'clear': {
-      return await handleClearCommand(interaction, userId);
-    }
-    case 'expense': {
+    case 'summary':
+      return await handleSummaryCommand(userId);
+    case 'help':
+      return handleHelpCommand();
+    case 'clear':
+      return await handleClearCommand(userId);
+    case 'expense':
       return await handleExpenseCommand(interaction, userId);
-    }
-    default: {
-      return new Response(JSON.stringify({
+    default:
+      return jsonResponse({
         type: 4,
         data: { content: 'Unknown command.', flags: 64 },
-      }), {
-        headers: { 'Content-Type': 'application/json' },
       });
-    }
   }
 }
 
 /**
  * Handle button/component interactions.
  */
-async function handleComponent(interaction: any, token: string): Promise<Response> {
+async function handleComponent(interaction: any): Promise<Response> {
   const userId = BigInt(interaction.member?.user?.id || interaction.user?.id || '0');
   const customId = interaction.data?.custom_id;
 
+  console.log(`[COMPONENT] User ${userId} clicked: ${customId}`);
+
   if (!isUserAllowed(userId)) {
-    return new Response(JSON.stringify({
+    return jsonResponse({
       type: 4,
       data: { content: '❌ Unauthorized.', flags: 64 },
-    }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   }
 
-  // Parse custom ID (format: "confirm:transactionData" or "cancel")
   if (customId?.startsWith('confirm:')) {
     const transactionJson = customId.replace('confirm:', '');
     try {
       const transaction: Transaction = JSON.parse(decodeURIComponent(transactionJson));
       await addTransaction(userId, transaction);
 
-      return new Response(JSON.stringify({
+      return jsonResponse({
         type: 4,
         data: {
           content: `✅ **Saved!** Recorded ${formatCurrency(transaction.amount, transaction.currency)} for **${transaction.category}**.`,
         },
-      }), {
-        headers: { 'Content-Type': 'application/json' },
       });
     } catch (error) {
       console.error('[COMPONENT] Error saving transaction:', error);
-      return new Response(JSON.stringify({
+      return jsonResponse({
         type: 4,
         data: { content: '❌ Failed to save transaction.', flags: 64 },
-      }), {
-        headers: { 'Content-Type': 'application/json' },
       });
     }
   }
 
   if (customId === 'cancel') {
-    return new Response(JSON.stringify({
+    return jsonResponse({
       type: 4,
       data: { content: '❌ Transaction cancelled.' },
-    }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   }
 
-  return new Response(JSON.stringify({
+  return jsonResponse({
     type: 4,
     data: { content: 'Unknown action.' },
-  }), {
-    headers: { 'Content-Type': 'application/json' },
   });
-}
-
-/**
- * Handle modal submit interactions.
- */
-async function handleModalSubmit(interaction: any, token: string): Promise<Response> {
-  // Reserved for future use (e.g., detailed expense form)
-  return new Response(JSON.stringify({
-    type: 4,
-    data: { content: 'Modal received.' },
-  }), {
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
-
-/**
- * Register slash commands.
- */
-async function registerCommands(bot: Bot, guildId: bigint): Promise<void> {
-  try {
-    // /summary command
-    await bot.helpers.createGuildApplicationCommand(guildId, {
-      name: 'summary',
-      description: 'Show your spending summary for the current month',
-      type: 1,
-    });
-
-    // /help command
-    await bot.helpers.createGuildApplicationCommand(guildId, {
-      name: 'help',
-      description: 'Show available commands and how to use the bot',
-      type: 1,
-    });
-
-    // /clear command
-    await bot.helpers.createGuildApplicationCommand(guildId, {
-      name: 'clear',
-      description: 'Clear all your transaction data',
-      type: 1,
-    });
-
-    // /expense command for logging expenses via slash command
-    await bot.helpers.createGuildApplicationCommand(guildId, {
-      name: 'expense',
-      description: 'Log a new expense using natural language',
-      type: 1,
-      options: [{
-        name: 'description',
-        description: 'Describe your expense (e.g., "Bought groceries for $50")',
-        type: 3, // STRING
-        required: true,
-      }],
-    });
-
-    console.log('[DISCORD] Slash commands registered');
-  } catch (error) {
-    console.error('[DISCORD] Failed to register commands:', error);
-  }
 }
 
 /**
  * Handle /summary command.
  */
-async function handleSummaryCommand(interaction: any, userId: bigint): Promise<Response> {
+async function handleSummaryCommand(userId: bigint): Promise<Response> {
   try {
     const summaries = await getMonthlySummary(userId);
     const total = await getMonthlyTotal(userId);
 
     if (summaries.length === 0) {
-      return new Response(JSON.stringify({
+      return jsonResponse({
         type: 4,
         data: {
           content: `📊 No expenses recorded for ${formatMonthYear()}. Start logging your expenses!`,
         },
-      }), {
-        headers: { 'Content-Type': 'application/json' },
       });
     }
 
@@ -411,7 +406,7 @@ async function handleSummaryCommand(interaction: any, userId: bigint): Promise<R
       inline: true,
     }));
 
-    return new Response(JSON.stringify({
+    return jsonResponse({
       type: 4,
       data: {
         embeds: [{
@@ -419,19 +414,14 @@ async function handleSummaryCommand(interaction: any, userId: bigint): Promise<R
           description: `**Total Spent:** ${formatCurrency(total)}`,
           color: COLORS.INFO,
           fields,
-          footer: { text: 'Keep tracking your expenses!' },
         }],
       },
-    }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   } catch (error) {
     console.error('[COMMAND] Error in summary command:', error);
-    return new Response(JSON.stringify({
+    return jsonResponse({
       type: 4,
       data: { content: '❌ Failed to generate summary.', flags: 64 },
-    }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   }
 }
@@ -439,7 +429,7 @@ async function handleSummaryCommand(interaction: any, userId: bigint): Promise<R
 /**
  * Handle /help command.
  */
-function handleHelpCommand(interaction: any): Response {
+function handleHelpCommand(): Response {
   const helpText = `💰 **Family Finance Bot - Help**
 
 **How to Log Expenses:**
@@ -458,33 +448,27 @@ Food, Transportation, Utilities, Entertainment, Shopping, Healthcare, Education,
 • The bot will ask you to confirm before saving
 • Click ✅ to save or ❌ to cancel`;
 
-  return new Response(JSON.stringify({
+  return jsonResponse({
     type: 4,
     data: { content: helpText },
-  }), {
-    headers: { 'Content-Type': 'application/json' },
   });
 }
 
 /**
  * Handle /clear command.
  */
-async function handleClearCommand(interaction: any, userId: bigint): Promise<Response> {
+async function handleClearCommand(userId: bigint): Promise<Response> {
   try {
     await clearUserTransactions(userId);
-    return new Response(JSON.stringify({
+    return jsonResponse({
       type: 4,
       data: { content: '🗑️ All your transaction data has been cleared.', flags: 64 },
-    }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   } catch (error) {
     console.error('[COMMAND] Error in clear command:', error);
-    return new Response(JSON.stringify({
+    return jsonResponse({
       type: 4,
       data: { content: '❌ Failed to clear transactions.', flags: 64 },
-    }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   }
 }
@@ -496,27 +480,23 @@ async function handleExpenseCommand(interaction: any, userId: bigint): Promise<R
   const description = interaction.data?.options?.[0]?.value;
 
   if (!description) {
-    return new Response(JSON.stringify({
+    return jsonResponse({
       type: 4,
       data: { content: '❌ Please provide an expense description.', flags: 64 },
-    }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   }
 
+  console.log(`[EXPENSE] Parsing: "${description}"`);
   auditLog('EXPENSE_PARSE', userId, description.substring(0, 50));
 
-  // Parse with AI
   const parsed = await parseExpenseWithAI(description);
 
   if (!parsed.success) {
-    return new Response(JSON.stringify({
+    return jsonResponse({
       type: 4,
       data: {
-        content: `❌ ${parsed.error || 'Could not parse your expense.'}\n\nTry something like:\n• "Bought groceries for $50"\n• "Paid electric bill 120 USD"`,
+        content: `❌ ${parsed.error || 'Could not parse your expense.'}\n\nTry: "Bought groceries for $50"`,
       },
-    }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   }
 
@@ -528,77 +508,11 @@ async function handleExpenseCommand(interaction: any, userId: bigint): Promise<R
     currency: parsed.currency,
   };
 
-  // Create confirmation with buttons
   const transactionJson = encodeURIComponent(JSON.stringify(transaction));
 
-  return new Response(JSON.stringify({
+  return jsonResponse({
     type: 4,
     data: {
-      content: `📝 **I understood:**\n💰 **Amount:** ${formatCurrency(transaction.amount, transaction.currency)}\n📁 **Category:** ${transaction.category}\n📅 **Date:** ${transaction.date}\n📝 **Note:** ${transaction.note}\n\nClick a button to confirm or cancel.`,
-      components: [{
-        type: 1,
-        components: [
-          {
-            type: 2, // BUTTON
-            style: 3, // SUCCESS
-            label: '✅ Confirm',
-            custom_id: `confirm:${transactionJson}`,
-          },
-          {
-            type: 2, // BUTTON
-            style: 4, // DANGER
-            label: '❌ Cancel',
-            custom_id: 'cancel',
-          },
-        ],
-      }],
-    },
-  }), {
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
-
-/**
- * Set up Gateway event handlers (for local development).
- */
-function setupGatewayEventHandlers(): void {
-  bot.events.ready = () => {
-    console.log(`[DISCORD] Bot is ready!`);
-  };
-
-  bot.events.messageCreate = async (_bot, message) => {
-    if (message.isBot || !message.content) return;
-
-    const userId = message.authorId;
-    const content = message.content.trim();
-
-    if (!isUserAllowed(userId)) return;
-    if (content.startsWith('/')) return;
-    if (!mightBeExpense(content)) return;
-
-    auditLog('EXPENSE_PARSE', userId, content.substring(0, 50));
-
-    // Parse with AI
-    const parsed = await parseExpenseWithAI(content);
-
-    if (!parsed.success) {
-      await bot.helpers.sendMessage(message.channelId, {
-        content: `❌ ${parsed.error || 'Could not parse your expense.'}`,
-      });
-      return;
-    }
-
-    const transaction: Transaction = {
-      amount: parsed.amount!,
-      category: parsed.category!,
-      date: parsed.date!,
-      note: parsed.note || content,
-      currency: parsed.currency,
-    };
-
-    const transactionJson = encodeURIComponent(JSON.stringify(transaction));
-
-    await bot.helpers.sendMessage(message.channelId, {
       content: `📝 **I understood:**\n💰 **Amount:** ${formatCurrency(transaction.amount, transaction.currency)}\n📁 **Category:** ${transaction.category}\n📅 **Date:** ${transaction.date}\n📝 **Note:** ${transaction.note}\n\nClick a button to confirm or cancel.`,
       components: [{
         type: 1,
@@ -617,56 +531,11 @@ function setupGatewayEventHandlers(): void {
           },
         ],
       }],
-    });
-  };
-
-  bot.events.interactionCreate = async (_bot, interaction) => {
-    if (interaction.type !== 2 && interaction.type !== 3) return;
-
-    const userId = BigInt(interaction.user?.id || '0');
-
-    if (!isUserAllowed(userId)) {
-      await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
-        type: 4,
-        data: { content: '❌ Unauthorized.', flags: 64 },
-      });
-      return;
-    }
-
-    // Handle buttons
-    if (interaction.type === 3) {
-      const customId = interaction.data?.custom_id;
-
-      if (customId?.startsWith('confirm:')) {
-        const transactionJson = customId.replace('confirm:', '');
-        try {
-          const transaction: Transaction = JSON.parse(decodeURIComponent(transactionJson));
-          await addTransaction(userId, transaction);
-
-          await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
-            type: 4,
-            data: {
-              content: `✅ **Saved!** Recorded ${formatCurrency(transaction.amount, transaction.currency)} for **${transaction.category}**.`,
-            },
-          });
-        } catch (error) {
-          console.error('[INTERACTION] Error saving transaction:', error);
-        }
-      } else if (customId === 'cancel') {
-        await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
-          type: 4,
-          data: { content: '❌ Transaction cancelled.' },
-        });
-      }
-    }
-  };
-
-  bot.events.error = (_bot, error) => {
-    console.error('[DISCORD] Bot error:', error);
-  };
+    },
+  });
 }
 
-// Run the bot
+// Start the bot
 main().catch((error) => {
   console.error('[FATAL] Unhandled error:', error);
   Deno.exit(1);
