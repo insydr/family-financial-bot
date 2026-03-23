@@ -113,7 +113,7 @@ When setting up in the Deno Deploy dashboard, use these settings:
 
 | Setting | Value |
 |---------|-------|
-| **Entrypoint** | `mod.ts` |
+| **Entrypoint** | `main.ts` |
 | **Arguments** | *(Leave empty)* |
 | **Runtime Working Directory** | `/` (root) |
 | **Runtime Memory Limit** | Default or 512 MB |
