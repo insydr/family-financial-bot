@@ -1,14 +1,15 @@
 {
   "name": "family-finance-bot",
   "version": "1.0.0",
+  "exports": "./mod.ts",
   "description": "A Discord bot for managing family finances with AI-powered expense parsing",
   "tasks": {
     "start": "deno run --allow-env --allow-net --allow-read --allow-sys --unstable-kv mod.ts",
     "dev": "deno run --allow-env --allow-net --allow-read --allow-sys --unstable-kv --watch mod.ts"
   },
   "imports": {
-    "discordeno": "jsr:@discordeno/bot@^21.0.0",
-    "std/dotenv": "jsr:@std/dotenv@^0.225.0"
+    "discordeno": "https://deno.land/x/discordeno@18.0.1/mod.ts",
+    "std/dotenv": "jsr:@std/dotenv@0.225.0"
   },
   "compilerOptions": {
     "lib": ["deno.window", "deno.unstable"]
@@ -20,15 +21,5 @@
     "semiColons": true,
     "singleQuote": true,
     "proseWrap": "preserve"
-  },
-  "deploy": {
-    "project": "family-finance-bot",
-    "entrypoint": "mod.ts",
-    "exclude": [
-      ".env",
-      ".env.local",
-      "*.kv",
-      "deno.lock"
-    ]
   }
 }
