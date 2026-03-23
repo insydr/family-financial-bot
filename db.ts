@@ -53,6 +53,12 @@ let kv: Deno.Kv | null = null;
  * Initialize the Deno KV database connection.
  * Must be called once at bot startup.
  * 
+ * On Deno Deploy, you need to create a KV database first:
+ * 1. Go to Deno Deploy Dashboard
+ * 2. Select your project
+ * 3. Go to "Databases" tab
+ * 4. Click "Create Database"
+ * 
  * @returns The KV instance for direct access if needed
  */
 export async function initializeDatabase(): Promise<Deno.Kv> {
@@ -61,12 +67,36 @@ export async function initializeDatabase(): Promise<Deno.Kv> {
   }
 
   try {
+    // Check if Deno.openKv is available
+    if (typeof Deno.openKv !== 'function') {
+      throw new Error(
+        'Deno KV is not available. On Deno Deploy, create a KV database in the dashboard first:\n' +
+        '1. Go to your project in Deno Deploy Dashboard\n' +
+        '2. Click "Databases" tab\n' +
+        '3. Click "Create Database"\n' +
+        '4. Redeploy the project'
+      );
+    }
+
+    // Open the default KV database
     kv = await Deno.openKv();
     console.log('[DATABASE] Deno KV initialized successfully');
     return kv;
   } catch (error) {
     console.error('[DATABASE] Failed to initialize Deno KV:', error);
-    throw new Error('Failed to initialize database. Ensure Deno has KV support.');
+    
+    // Provide more helpful error message
+    if (error instanceof Error) {
+      if (error.message.includes('not a function')) {
+        throw new Error(
+          'Deno KV is not available on this runtime.\n' +
+          'On Deno Deploy: Create a KV database in the project dashboard first.\n' +
+          'Locally: Run with Deno 2.0+ (KV is stable, no flags needed).'
+        );
+      }
+      throw error;
+    }
+    throw new Error('Failed to initialize database. Please check Deno KV availability.');
   }
 }
 

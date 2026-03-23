@@ -1,7 +1,7 @@
 {
   "tasks": {
-    "start": "deno run --allow-env --allow-net --allow-read --allow-sys --unstable-kv main.ts",
-    "dev": "deno run --allow-env --allow-net --allow-read --allow-sys --unstable-kv --watch main.ts"
+    "start": "deno run --allow-env --allow-net --allow-read --allow-sys main.ts",
+    "dev": "deno run --allow-env --allow-net --allow-read --allow-sys --watch main.ts"
   },
   "imports": {
     "discordeno": "https://deno.land/x/discordeno@18.0.1/mod.ts",
