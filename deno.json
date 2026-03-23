@@ -20,5 +20,15 @@
     "semiColons": true,
     "singleQuote": true,
     "proseWrap": "preserve"
+  },
+  "deploy": {
+    "project": "family-finance-bot",
+    "entrypoint": "mod.ts",
+    "exclude": [
+      ".env",
+      ".env.local",
+      "*.kv",
+      "deno.lock"
+    ]
   }
 }

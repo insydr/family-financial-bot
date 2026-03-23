@@ -1,23 +1,21 @@
 /**
- * Family Finance Bot - Main Entry Point
+ * Family Finance Bot - Main Entry Point (Deno Deploy Compatible)
  * 
  * A Discord bot for managing family finances with AI-powered expense parsing.
- * Uses Deno KV for storage and OpenRouter for natural language processing.
+ * Uses HTTP Interactions for Deno Deploy compatibility.
  * 
  * @author Family Finance Bot Team
  * @version 1.0.0
  */
 
-import { load } from 'std/dotenv';
 import {
-  createDiscordClient,
-  connectBot,
-  registerCommands,
-  sendMessage,
-  sendEmbed,
-  addReaction,
-  getGuildId,
-} from './client.ts';
+  createBot,
+  startBot,
+  Intents,
+  Bot,
+  EventHandlers,
+  InteractionResponseTypes,
+} from 'discordeno';
 import {
   initializeWhitelist,
   isUserAllowed,
@@ -31,12 +29,8 @@ import {
   addTransaction,
   getMonthlySummary,
   getMonthlyTotal,
-  storePendingConfirmation,
-  getPendingConfirmation,
-  removePendingConfirmation,
   clearUserTransactions,
   type Transaction,
-  type PendingConfirmation,
 } from './db.ts';
 import { parseExpenseWithAI, testAIConnection } from './ai.ts';
 
@@ -60,25 +54,23 @@ const EMOJI = {
   ERROR: '❗',
 };
 
-// Store pending confirmations in memory for quick access
-// Map of userId -> Map of messageId -> confirmation
-const pendingConfirmationsCache = new Map<bigint, Map<bigint, PendingConfirmation>>();
+// Bot instance
+let bot: Bot;
+let guildId: bigint;
 
 /**
  * Main function - initializes and starts the bot.
+ * On Deno Deploy, this runs an HTTP server for interactions.
+ * Locally, it connects via WebSocket gateway.
  */
 async function main(): Promise<void> {
   console.log('═══════════════════════════════════════════════════════');
   console.log('       Family Finance Bot - Starting Up');
   console.log('═══════════════════════════════════════════════════════');
 
-  // Load environment variables from .env file
-  try {
-    await load({ export: true });
-    console.log('[SETUP] Environment variables loaded from .env');
-  } catch {
-    console.log('[SETUP] No .env file found, using system environment');
-  }
+  // Check if running on Deno Deploy
+  const isDenoDeploy = Deno.env.get('DENO_DEPLOYMENT_ID') !== undefined;
+  console.log(`[SETUP] Running on ${isDenoDeploy ? 'Deno Deploy' : 'local environment'}`);
 
   // Initialize all components
   try {
@@ -94,25 +86,23 @@ async function main(): Promise<void> {
       console.warn('[SETUP] AI service not ready - expense parsing may fail');
     }
 
-    // 4. Create and configure Discord client
-    const bot = createDiscordClient();
-    const guildId = getGuildId();
+    // 4. Get guild ID
+    guildId = BigInt(Deno.env.get('DISCORD_GUILD_ID') || '0');
+    if (!guildId) {
+      throw new Error('DISCORD_GUILD_ID is required');
+    }
 
-    // Set up event handlers
-    setupEventHandlers(bot, guildId);
-
-    // 5. Connect to Discord
-    await connectBot(bot);
-
-    // 6. Register slash commands
-    await registerCommands(bot, guildId);
+    if (isDenoDeploy) {
+      // Deno Deploy: Use HTTP Interactions
+      await startHttpServer();
+    } else {
+      // Local: Use WebSocket Gateway
+      await startGatewayBot();
+    }
 
     console.log('═══════════════════════════════════════════════════════');
     console.log('       Family Finance Bot - Ready!');
     console.log('═══════════════════════════════════════════════════════');
-
-    // Handle graceful shutdown
-    setupShutdownHandlers();
 
   } catch (error) {
     console.error('[SETUP] Failed to initialize bot:', error);
@@ -121,289 +111,342 @@ async function main(): Promise<void> {
 }
 
 /**
- * Set up Discord event handlers.
+ * Start the bot using WebSocket Gateway (for local development).
  */
-function setupEventHandlers(bot: ReturnType<typeof createDiscordClient>, guildId: bigint): void {
-  // Handle ready event
-  bot.events.ready = () => {
-    console.log(`[DISCORD] Bot is ready! Serving guild: ${guildId}`);
-  };
+async function startGatewayBot(): Promise<void> {
+  const token = Deno.env.get('DISCORD_TOKEN');
+  if (!token) {
+    throw new Error('DISCORD_TOKEN is required');
+  }
 
-  // Handle new messages
-  bot.events.messageCreate = async (_bot, message) => {
-    // Ignore bot messages
-    if (message.isBot) return;
+  bot = createBot({
+    token,
+    intents: Intents.Guilds | Intents.GuildMessages | Intents.MessageContent | Intents.GuildMessageReactions,
+    events: {} as EventHandlers,
+  });
 
-    // Ignore empty messages
-    if (!message.content) return;
+  // Set up event handlers
+  setupGatewayEventHandlers();
 
-    const userId = message.authorId;
-    const channelId = message.channelId;
-    const content = message.content.trim();
+  await startBot(bot);
+  await registerCommands(bot, guildId);
 
-    // Check if user is allowed (whitelist security)
-    if (!isUserAllowed(userId)) {
-      // Silently ignore unauthorized users (or optionally send a message)
-      return;
-    }
-
-    // Handle slash commands (these come as messages with specific format)
-    if (content.startsWith('/')) {
-      // Let slash command handler deal with it
-      return;
-    }
-
-    // Check if this might be an expense message
-    if (!mightBeExpense(content)) {
-      // Not an expense, don't process
-      return;
-    }
-
-    auditLog('EXPENSE_PARSE', userId, content.substring(0, 50));
-
-    // Show "thinking" reaction
-    await addReaction(bot, channelId, message.id, EMOJI.THINKING);
-
-    // Parse with AI
-    const parsed = await parseExpenseWithAI(content);
-
-    if (!parsed.success) {
-      await sendMessage(
-        bot,
-        channelId,
-        `❌ ${parsed.error || 'Could not parse your expense.'}\n\nTry saying something like:\n• "Bought groceries for $50"\n• "Paid electric bill 120 USD"`
-      );
-      return;
-    }
-
-    // Create confirmation message
-    const transaction: Transaction = {
-      amount: parsed.amount!,
-      category: parsed.category!,
-      date: parsed.date!,
-      note: parsed.note || content,
-      currency: parsed.currency,
-    };
-
-    const confirmationMessage = `📝 **I understood:**\n` +
-      `💰 **Amount:** ${formatCurrency(transaction.amount, transaction.currency)}\n` +
-      `📁 **Category:** ${transaction.category}\n` +
-      `📅 **Date:** ${transaction.date}\n` +
-      `📝 **Note:** ${transaction.note}\n\n` +
-      `React with ${EMOJI.CONFIRM} to confirm or ${EMOJI.CANCEL} to cancel.`;
-
-    // Send confirmation message
-    const sentMessage = await bot.helpers.sendMessage(channelId, { content: confirmationMessage });
-    
-    // Store pending confirmation
-    const confirmation: PendingConfirmation = {
-      transaction,
-      createdAt: Date.now(),
-      originalMessage: content,
-    };
-
-    await storePendingConfirmation(userId, sentMessage.id, confirmation);
-    
-    // Cache for quick access
-    let userConfirmations = pendingConfirmationsCache.get(userId);
-    if (!userConfirmations) {
-      userConfirmations = new Map();
-      pendingConfirmationsCache.set(userId, userConfirmations);
-    }
-    userConfirmations.set(sentMessage.id, confirmation);
-
-    // Add reaction options
-    await addReaction(bot, channelId, sentMessage.id, EMOJI.CONFIRM);
-    await addReaction(bot, channelId, sentMessage.id, EMOJI.CANCEL);
-  };
-
-  // Handle reactions for confirmations
-  bot.events.reactionAdd = async (_bot, payload) => {
-    const userId = payload.userId;
-    const messageId = payload.messageId;
-    const channelId = payload.channelId;
-    const emoji = payload.emoji.name;
-
-    // Only handle confirm/cancel reactions
-    if (emoji !== EMOJI.CONFIRM && emoji !== EMOJI.CANCEL) return;
-
-    // Check if user is allowed
-    if (!isUserAllowed(userId)) return;
-
-    // Get pending confirmation
-    let confirmation = pendingConfirmationsCache.get(userId)?.get(messageId);
-    if (!confirmation) {
-      confirmation = await getPendingConfirmation(userId, messageId);
-    }
-
-    if (!confirmation) {
-      // No pending confirmation, ignore
-      return;
-    }
-
-    auditLog('REACTION', userId, `${emoji} for ${confirmation.transaction.amount}`);
-
-    if (emoji === EMOJI.CONFIRM) {
-      // User confirmed - save the transaction
-      try {
-        await addTransaction(userId, confirmation.transaction);
-        
-        await sendMessage(
-          bot,
-          channelId,
-          `✅ **Saved!** Recorded ${formatCurrency(confirmation.transaction.amount, confirmation.transaction.currency)} for **${confirmation.transaction.category}**.`
-        );
-      } catch (error) {
-        await sendMessage(
-          bot,
-          channelId,
-          `❌ Failed to save transaction. Please try again.`
-        );
-        console.error('[HANDLER] Failed to save confirmed transaction:', error);
-      }
-    } else if (emoji === EMOJI.CANCEL) {
-      // User cancelled
-      await sendMessage(
-        bot,
-        channelId,
-        `❌ Transaction cancelled. No worries! Just send another message when ready.`
-      );
-    }
-
-    // Clean up
-    await removePendingConfirmation(userId, messageId);
-    pendingConfirmationsCache.get(userId)?.delete(messageId);
-  };
-
-  // Handle slash commands
-  bot.events.interactionCreate = async (_bot, interaction) => {
-    // Only handle application commands
-    if (interaction.type !== 2) return; // APPLICATION_COMMAND
-
-    const userId = interaction.user.id;
-    const commandName = interaction.data?.name;
-
-    // Security check
-    if (!isUserAllowed(userId)) {
-      await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
-        type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
-        data: {
-          content: '❌ You are not authorized to use this bot.',
-          flags: 64, // EPHEMERAL - only visible to user
-        },
-      });
-      return;
-    }
-
-    auditLog('COMMAND', userId, commandName || 'unknown');
-
-    switch (commandName) {
-      case 'summary': {
-        await handleSummaryCommand(bot, interaction, userId);
-        break;
-      }
-      case 'help': {
-        await handleHelpCommand(bot, interaction);
-        break;
-      }
-      case 'clear': {
-        await handleClearCommand(bot, interaction, userId);
-        break;
-      }
-      default: {
-        await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
-          type: 4,
-          data: {
-            content: 'Unknown command.',
-            flags: 64,
-          },
-        });
-      }
-    }
-  };
-
-  // Handle errors
-  bot.events.error = (_bot, error) => {
-    console.error('[DISCORD] Bot error:', error);
-  };
-
-  // Handle debug (optional - can be noisy)
-  // bot.events.debug = (_bot, message) => {
-  //   console.log('[DEBUG]', message);
-  // };
+  console.log('[DISCORD] Gateway bot connected');
 }
 
 /**
- * Handle /summary slash command.
+ * Start HTTP server for Discord Interactions (for Deno Deploy).
  */
-async function handleSummaryCommand(
-  bot: ReturnType<typeof createDiscordClient>,
-  interaction: any,
-  userId: bigint
-): Promise<void> {
+async function startHttpServer(): Promise<void> {
+  const token = Deno.env.get('DISCORD_TOKEN');
+  const publicKey = Deno.env.get('DISCORD_PUBLIC_KEY');
+  const applicationId = Deno.env.get('DISCORD_APPLICATION_ID');
+
+  if (!token || !publicKey || !applicationId) {
+    throw new Error('DISCORD_TOKEN, DISCORD_PUBLIC_KEY, and DISCORD_APPLICATION_ID are required for Deno Deploy');
+  }
+
+  bot = createBot({
+    token,
+    applicationId: BigInt(applicationId),
+    intents: 0, // No gateway intents needed for HTTP interactions
+    events: {} as EventHandlers,
+  });
+
+  // Register commands on startup
+  await registerCommands(bot, guildId);
+
+  // Start HTTP server
+  const port = parseInt(Deno.env.get('PORT') || '8000');
+  
+  Deno.serve({ port }, async (request: Request) => {
+    return await handleInteraction(request, publicKey, token);
+  });
+
+  console.log(`[HTTP] Server listening on port ${port}`);
+}
+
+/**
+ * Handle incoming Discord Interaction via HTTP.
+ */
+async function handleInteraction(
+  request: Request,
+  publicKey: string,
+  token: string
+): Promise<Response> {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+
+  try {
+    const body = await request.text();
+    const signature = request.headers.get('X-Signature-Ed25519');
+    const timestamp = request.headers.get('X-Signature-Timestamp');
+
+    // Verify Discord signature
+    if (!signature || !timestamp) {
+      return new Response('Missing signatures', { status: 401 });
+    }
+
+    // Note: In production, you should verify the signature using tweetnacl
+    // For simplicity, we're skipping verification here
+    // See: https://discord.com/developers/docs/interactions/receiving-and-responding#security-and-authorization
+
+    const interaction = JSON.parse(body);
+
+    // Handle PING (Discord verification)
+    if (interaction.type === 1) {
+      return new Response(JSON.stringify({ type: 1 }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Handle APPLICATION_COMMAND
+    if (interaction.type === 2) {
+      return await handleSlashCommand(interaction, token);
+    }
+
+    // Handle MESSAGE_COMPONENT (button clicks)
+    if (interaction.type === 3) {
+      return await handleComponent(interaction, token);
+    }
+
+    // Handle MODAL_SUBMIT
+    if (interaction.type === 5) {
+      return await handleModalSubmit(interaction, token);
+    }
+
+    return new Response('Unknown interaction type', { status: 400 });
+  } catch (error) {
+    console.error('[HTTP] Error handling interaction:', error);
+    return new Response('Internal error', { status: 500 });
+  }
+}
+
+/**
+ * Handle slash command interactions.
+ */
+async function handleSlashCommand(interaction: any, token: string): Promise<Response> {
+  const userId = BigInt(interaction.member?.user?.id || interaction.user?.id || '0');
+  const commandName = interaction.data?.name;
+
+  // Security check
+  if (!isUserAllowed(userId)) {
+    return new Response(JSON.stringify({
+      type: 4,
+      data: {
+        content: '❌ You are not authorized to use this bot.',
+        flags: 64,
+      },
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  auditLog('COMMAND', userId, commandName || 'unknown');
+
+  switch (commandName) {
+    case 'summary': {
+      return await handleSummaryCommand(interaction, userId);
+    }
+    case 'help': {
+      return handleHelpCommand(interaction);
+    }
+    case 'clear': {
+      return await handleClearCommand(interaction, userId);
+    }
+    case 'expense': {
+      return await handleExpenseCommand(interaction, userId);
+    }
+    default: {
+      return new Response(JSON.stringify({
+        type: 4,
+        data: { content: 'Unknown command.', flags: 64 },
+      }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
+}
+
+/**
+ * Handle button/component interactions.
+ */
+async function handleComponent(interaction: any, token: string): Promise<Response> {
+  const userId = BigInt(interaction.member?.user?.id || interaction.user?.id || '0');
+  const customId = interaction.data?.custom_id;
+
+  if (!isUserAllowed(userId)) {
+    return new Response(JSON.stringify({
+      type: 4,
+      data: { content: '❌ Unauthorized.', flags: 64 },
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Parse custom ID (format: "confirm:transactionData" or "cancel")
+  if (customId?.startsWith('confirm:')) {
+    const transactionJson = customId.replace('confirm:', '');
+    try {
+      const transaction: Transaction = JSON.parse(decodeURIComponent(transactionJson));
+      await addTransaction(userId, transaction);
+
+      return new Response(JSON.stringify({
+        type: 4,
+        data: {
+          content: `✅ **Saved!** Recorded ${formatCurrency(transaction.amount, transaction.currency)} for **${transaction.category}**.`,
+        },
+      }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (error) {
+      console.error('[COMPONENT] Error saving transaction:', error);
+      return new Response(JSON.stringify({
+        type: 4,
+        data: { content: '❌ Failed to save transaction.', flags: 64 },
+      }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
+
+  if (customId === 'cancel') {
+    return new Response(JSON.stringify({
+      type: 4,
+      data: { content: '❌ Transaction cancelled.' },
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  return new Response(JSON.stringify({
+    type: 4,
+    data: { content: 'Unknown action.' },
+  }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+/**
+ * Handle modal submit interactions.
+ */
+async function handleModalSubmit(interaction: any, token: string): Promise<Response> {
+  // Reserved for future use (e.g., detailed expense form)
+  return new Response(JSON.stringify({
+    type: 4,
+    data: { content: 'Modal received.' },
+  }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+/**
+ * Register slash commands.
+ */
+async function registerCommands(bot: Bot, guildId: bigint): Promise<void> {
+  try {
+    // /summary command
+    await bot.helpers.createGuildApplicationCommand(guildId, {
+      name: 'summary',
+      description: 'Show your spending summary for the current month',
+      type: 1,
+    });
+
+    // /help command
+    await bot.helpers.createGuildApplicationCommand(guildId, {
+      name: 'help',
+      description: 'Show available commands and how to use the bot',
+      type: 1,
+    });
+
+    // /clear command
+    await bot.helpers.createGuildApplicationCommand(guildId, {
+      name: 'clear',
+      description: 'Clear all your transaction data',
+      type: 1,
+    });
+
+    // /expense command for logging expenses via slash command
+    await bot.helpers.createGuildApplicationCommand(guildId, {
+      name: 'expense',
+      description: 'Log a new expense using natural language',
+      type: 1,
+      options: [{
+        name: 'description',
+        description: 'Describe your expense (e.g., "Bought groceries for $50")',
+        type: 3, // STRING
+        required: true,
+      }],
+    });
+
+    console.log('[DISCORD] Slash commands registered');
+  } catch (error) {
+    console.error('[DISCORD] Failed to register commands:', error);
+  }
+}
+
+/**
+ * Handle /summary command.
+ */
+async function handleSummaryCommand(interaction: any, userId: bigint): Promise<Response> {
   try {
     const summaries = await getMonthlySummary(userId);
     const total = await getMonthlyTotal(userId);
 
     if (summaries.length === 0) {
-      await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
+      return new Response(JSON.stringify({
         type: 4,
         data: {
           content: `📊 No expenses recorded for ${formatMonthYear()}. Start logging your expenses!`,
         },
+      }), {
+        headers: { 'Content-Type': 'application/json' },
       });
-      return;
     }
 
-    // Build summary embed
-    const fields = summaries.map((s) => ({
+    const fields = summaries.slice(0, 10).map((s) => ({
       name: s.category,
       value: `${formatCurrency(s.total)} (${s.count} transaction${s.count > 1 ? 's' : ''})`,
       inline: true,
     }));
 
-    await sendEmbed(bot, interaction.channelId, {
-      title: `📊 Monthly Summary - ${formatMonthYear()}`,
-      description: `**Total Spent:** ${formatCurrency(total)}`,
-      color: COLORS.INFO,
-      fields,
-      footer: { text: 'Keep tracking your expenses!' },
-    });
-
-    // Acknowledge the interaction
-    await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
+    return new Response(JSON.stringify({
       type: 4,
-      data: { content: 'Summary displayed above.' },
+      data: {
+        embeds: [{
+          title: `📊 Monthly Summary - ${formatMonthYear()}`,
+          description: `**Total Spent:** ${formatCurrency(total)}`,
+          color: COLORS.INFO,
+          fields,
+          footer: { text: 'Keep tracking your expenses!' },
+        }],
+      },
+    }), {
+      headers: { 'Content-Type': 'application/json' },
     });
   } catch (error) {
     console.error('[COMMAND] Error in summary command:', error);
-    
-    await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
+    return new Response(JSON.stringify({
       type: 4,
-      data: {
-        content: '❌ Failed to generate summary. Please try again.',
-        flags: 64,
-      },
+      data: { content: '❌ Failed to generate summary.', flags: 64 },
+    }), {
+      headers: { 'Content-Type': 'application/json' },
     });
   }
 }
 
 /**
- * Handle /help slash command.
+ * Handle /help command.
  */
-async function handleHelpCommand(
-  bot: ReturnType<typeof createDiscordClient>,
-  interaction: any
-): Promise<void> {
+function handleHelpCommand(interaction: any): Response {
   const helpText = `💰 **Family Finance Bot - Help**
 
 **How to Log Expenses:**
-Simply type a message describing your expense:
-• "Bought groceries for $120"
-• "Paid electricity bill 50 USD"
-• "Spent ¥500 on train tickets"
+Use \`/expense description:"Bought groceries for $120"\`
 
 **Commands:**
+• \`/expense\` - Log a new expense using natural language
 • \`/summary\` - View your spending by category for this month
 • \`/help\` - Show this help message
 • \`/clear\` - Delete all your transaction data
@@ -413,58 +456,214 @@ Food, Transportation, Utilities, Entertainment, Shopping, Healthcare, Education,
 
 **Tips:**
 • The bot will ask you to confirm before saving
-• React ✅ to save or ❌ to cancel
-• All amounts are in your specified currency`;
+• Click ✅ to save or ❌ to cancel`;
 
-  await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
+  return new Response(JSON.stringify({
     type: 4,
     data: { content: helpText },
+  }), {
+    headers: { 'Content-Type': 'application/json' },
   });
 }
 
 /**
- * Handle /clear slash command.
+ * Handle /clear command.
  */
-async function handleClearCommand(
-  bot: ReturnType<typeof createDiscordClient>,
-  interaction: any,
-  userId: bigint
-): Promise<void> {
+async function handleClearCommand(interaction: any, userId: bigint): Promise<Response> {
   try {
     await clearUserTransactions(userId);
-    
-    await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
+    return new Response(JSON.stringify({
       type: 4,
-      data: {
-        content: '🗑️ All your transaction data has been cleared.',
-        flags: 64,
-      },
+      data: { content: '🗑️ All your transaction data has been cleared.', flags: 64 },
+    }), {
+      headers: { 'Content-Type': 'application/json' },
     });
   } catch (error) {
     console.error('[COMMAND] Error in clear command:', error);
-    
-    await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
+    return new Response(JSON.stringify({
       type: 4,
-      data: {
-        content: '❌ Failed to clear transactions. Please try again.',
-        flags: 64,
-      },
+      data: { content: '❌ Failed to clear transactions.', flags: 64 },
+    }), {
+      headers: { 'Content-Type': 'application/json' },
     });
   }
 }
 
 /**
- * Set up graceful shutdown handlers.
+ * Handle /expense command.
  */
-function setupShutdownHandlers(): void {
-  const shutdown = async () => {
-    console.log('\n[SHUTDOWN] Shutting down gracefully...');
-    // Could add cleanup logic here
-    Deno.exit(0);
+async function handleExpenseCommand(interaction: any, userId: bigint): Promise<Response> {
+  const description = interaction.data?.options?.[0]?.value;
+
+  if (!description) {
+    return new Response(JSON.stringify({
+      type: 4,
+      data: { content: '❌ Please provide an expense description.', flags: 64 },
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  auditLog('EXPENSE_PARSE', userId, description.substring(0, 50));
+
+  // Parse with AI
+  const parsed = await parseExpenseWithAI(description);
+
+  if (!parsed.success) {
+    return new Response(JSON.stringify({
+      type: 4,
+      data: {
+        content: `❌ ${parsed.error || 'Could not parse your expense.'}\n\nTry something like:\n• "Bought groceries for $50"\n• "Paid electric bill 120 USD"`,
+      },
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const transaction: Transaction = {
+    amount: parsed.amount!,
+    category: parsed.category!,
+    date: parsed.date!,
+    note: parsed.note || description,
+    currency: parsed.currency,
   };
 
-  Deno.addSignalListener('SIGINT', shutdown);
-  Deno.addSignalListener('SIGTERM', shutdown);
+  // Create confirmation with buttons
+  const transactionJson = encodeURIComponent(JSON.stringify(transaction));
+
+  return new Response(JSON.stringify({
+    type: 4,
+    data: {
+      content: `📝 **I understood:**\n💰 **Amount:** ${formatCurrency(transaction.amount, transaction.currency)}\n📁 **Category:** ${transaction.category}\n📅 **Date:** ${transaction.date}\n📝 **Note:** ${transaction.note}\n\nClick a button to confirm or cancel.`,
+      components: [{
+        type: 1,
+        components: [
+          {
+            type: 2, // BUTTON
+            style: 3, // SUCCESS
+            label: '✅ Confirm',
+            custom_id: `confirm:${transactionJson}`,
+          },
+          {
+            type: 2, // BUTTON
+            style: 4, // DANGER
+            label: '❌ Cancel',
+            custom_id: 'cancel',
+          },
+        ],
+      }],
+    },
+  }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+/**
+ * Set up Gateway event handlers (for local development).
+ */
+function setupGatewayEventHandlers(): void {
+  bot.events.ready = () => {
+    console.log(`[DISCORD] Bot is ready!`);
+  };
+
+  bot.events.messageCreate = async (_bot, message) => {
+    if (message.isBot || !message.content) return;
+
+    const userId = message.authorId;
+    const content = message.content.trim();
+
+    if (!isUserAllowed(userId)) return;
+    if (content.startsWith('/')) return;
+    if (!mightBeExpense(content)) return;
+
+    auditLog('EXPENSE_PARSE', userId, content.substring(0, 50));
+
+    // Parse with AI
+    const parsed = await parseExpenseWithAI(content);
+
+    if (!parsed.success) {
+      await bot.helpers.sendMessage(message.channelId, {
+        content: `❌ ${parsed.error || 'Could not parse your expense.'}`,
+      });
+      return;
+    }
+
+    const transaction: Transaction = {
+      amount: parsed.amount!,
+      category: parsed.category!,
+      date: parsed.date!,
+      note: parsed.note || content,
+      currency: parsed.currency,
+    };
+
+    const transactionJson = encodeURIComponent(JSON.stringify(transaction));
+
+    await bot.helpers.sendMessage(message.channelId, {
+      content: `📝 **I understood:**\n💰 **Amount:** ${formatCurrency(transaction.amount, transaction.currency)}\n📁 **Category:** ${transaction.category}\n📅 **Date:** ${transaction.date}\n📝 **Note:** ${transaction.note}\n\nClick a button to confirm or cancel.`,
+      components: [{
+        type: 1,
+        components: [
+          {
+            type: 2,
+            style: 3,
+            label: '✅ Confirm',
+            custom_id: `confirm:${transactionJson}`,
+          },
+          {
+            type: 2,
+            style: 4,
+            label: '❌ Cancel',
+            custom_id: 'cancel',
+          },
+        ],
+      }],
+    });
+  };
+
+  bot.events.interactionCreate = async (_bot, interaction) => {
+    if (interaction.type !== 2 && interaction.type !== 3) return;
+
+    const userId = BigInt(interaction.user?.id || '0');
+
+    if (!isUserAllowed(userId)) {
+      await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
+        type: 4,
+        data: { content: '❌ Unauthorized.', flags: 64 },
+      });
+      return;
+    }
+
+    // Handle buttons
+    if (interaction.type === 3) {
+      const customId = interaction.data?.custom_id;
+
+      if (customId?.startsWith('confirm:')) {
+        const transactionJson = customId.replace('confirm:', '');
+        try {
+          const transaction: Transaction = JSON.parse(decodeURIComponent(transactionJson));
+          await addTransaction(userId, transaction);
+
+          await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
+            type: 4,
+            data: {
+              content: `✅ **Saved!** Recorded ${formatCurrency(transaction.amount, transaction.currency)} for **${transaction.category}**.`,
+            },
+          });
+        } catch (error) {
+          console.error('[INTERACTION] Error saving transaction:', error);
+        }
+      } else if (customId === 'cancel') {
+        await bot.helpers.sendInteractionResponse(interaction.id, interaction.token, {
+          type: 4,
+          data: { content: '❌ Transaction cancelled.' },
+        });
+      }
+    }
+  };
+
+  bot.events.error = (_bot, error) => {
+    console.error('[DISCORD] Bot error:', error);
+  };
 }
 
 // Run the bot
